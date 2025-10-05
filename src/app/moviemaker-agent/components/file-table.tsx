@@ -28,6 +28,7 @@ import {
   Clock,
   Eye,
   RefreshCw,
+  Download,
 } from "lucide-react";
 import { FileDetailDialog } from "./file-detail-dialog";
 import { RetranscribeDialog } from "./retranscribe-dialog";
@@ -86,6 +87,23 @@ export function FileTable({
     null
   );
   const [retranscribeDialogOpen, setRetranscribeDialogOpen] = useState(false);
+
+  const handleDownload = (file: UploadedFile) => {
+    try {
+      const blob = file.file;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file.name || "download";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      // Delay revoke slightly to allow navigation to start in some browsers
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (e) {
+      console.error("Failed to download file", e);
+    }
+  };
 
   const handleViewDetails = (file: UploadedFile) => {
     setDetailFile(file);
@@ -177,6 +195,22 @@ export function FileTable({
                 </TableCell>
                 <TableCell>
                   <div className="flex items-center justify-end gap-1">
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-8 w-8"
+                          onClick={() => handleDownload(file)}
+                        >
+                          <Download className="h-4 w-4" />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p className="text-xs">Download</p>
+                      </TooltipContent>
+                    </Tooltip>
+
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <Button

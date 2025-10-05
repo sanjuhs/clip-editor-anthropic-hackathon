@@ -120,102 +120,74 @@ export default function MovieMakerAgent() {
       // Build the full prompt with context and conversation history
       const fullPrompt = buildFullPrompt(currentInput, filesContext, messages);
 
-      // First, check if tools should be used (detect keywords like "create", "make", "generate")
-      const shouldCheckTools =
-        currentInput.toLowerCase().includes("create") ||
-        currentInput.toLowerCase().includes("make") ||
-        currentInput.toLowerCase().includes("generate") ||
-        currentInput.toLowerCase().includes("yes") ||
-        currentInput.toLowerCase().includes("option");
+      // Always check tools first (non-streaming), then fall back to streaming if none
+      console.log("[Chat] Tool-check: calling callGroqAPIWithTools with tools");
+      const response = await callGroqAPIWithTools(
+        [
+          ...messages.map((m) => ({ role: m.role, content: m.content })),
+          { role: "user", content: currentInput },
+        ],
+        uploadedFiles
+      );
+      console.log("[Chat] Tool-check response:", response);
 
-      if (shouldCheckTools) {
-        console.log(
-          "[Chat] shouldCheckTools = true; calling callGroqAPIWithTools"
-        );
-        // Call non-streaming API to check for tool calls
-        const response = await callGroqAPIWithTools(
-          [
-            ...messages.map((m) => ({
-              role: m.role,
-              content: m.content,
-            })),
-            { role: "user", content: currentInput },
-          ],
-          uploadedFiles
-        );
+      // Show assistant content regardless
+      const assistantMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        role: "assistant",
+        content: response.content || "Processing your request...",
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, assistantMessage]);
 
-        console.log("[Chat] callGroqAPIWithTools response:", response);
+      const toolCalls = response.toolCalls || [];
+      if (toolCalls.length > 0) {
+        console.log(`[Chat] Executing ${toolCalls.length} tool call(s)`);
 
-        // Add assistant message
-        const assistantMessage: Message = {
-          id: (Date.now() + 1).toString(),
-          role: "assistant",
-          content: response.content || "Processing your request...",
-          timestamp: new Date(),
-        };
-        setMessages((prev) => [...prev, assistantMessage]);
+        for (let idx = 0; idx < toolCalls.length; idx++) {
+          const toolCall = toolCalls[idx];
 
-        // Check if there are tool calls
-        if (response.toolCalls && response.toolCalls.length > 0) {
-          const toolCall = response.toolCalls[0];
-          console.log("[Chat] Detected tool call:", toolCall);
-
-          // Show tool execution message with initial progress
           const toolMessage: Message = {
-            id: (Date.now() + 2).toString(),
+            id: (Date.now() + 2 + idx).toString(),
             role: "assistant",
-            content: `🎬 **Starting Video Processing**\n\n⏳ Initializing MediaBunny (FFmpeg.wasm)...\n\n*Progress: 0%*\n\n---\n\n**Tool:** ${
-              toolCall.name
-            }\n**Timeline Segments:** ${
+            content: `🎬 **Starting Tool ${idx + 1}/${
+              toolCalls.length
+            }**\n\n**Tool:** ${toolCall.name}\n**Segments:** ${
               toolCall.arguments.timeline?.length || 0
-            }`,
+            }\n\n*Progress: 0%*`,
             timestamp: new Date(),
           };
           setMessages((prev) => [...prev, toolMessage]);
 
           console.log(
-            "executeToolCall is in progress!!!v0.01",
+            "[Chat] executeToolCall →",
             toolCall.name,
             toolCall.arguments
           );
-
-          // Execute the tool with detailed progress tracking
           const { executeToolCall } = await import("./lib/agent-tools");
-          console.log("[Chat] Imported executeToolCall");
 
           let currentStage = "Initializing";
           let currentProgress = 0;
 
-          console.log(
-            "executeToolCall is in progress!!!v0.02",
-            toolCall.name,
-            toolCall.arguments
-          );
           const toolResult = await executeToolCall(
             toolCall.name,
             toolCall.arguments,
             (stage, progress) => {
               currentStage = stage;
               currentProgress = Math.round(progress);
-
-              console.log(`🎬 ${stage}: ${currentProgress}%`);
-
-              // Create a progress bar
               const progressBar =
                 "█".repeat(Math.floor(currentProgress / 5)) +
                 "░".repeat(20 - Math.floor(currentProgress / 5));
-
-              // Update the tool message with detailed progress
               setMessages((prev) =>
                 prev.map((msg) =>
                   msg.id === toolMessage.id
                     ? {
                         ...msg,
-                        content: `🎬 **Video Processing in Progress**\n\n**Current Stage:** ${stage}\n\n[\`${progressBar}\`] ${currentProgress}%\n\n---\n\n**Tool:** ${
+                        content: `🎬 **Video Processing**\n\n**Current Stage:** ${stage}\n\n[\`${progressBar}\`] ${currentProgress}%\n\n---\n\n**Tool:** ${
                           toolCall.name
-                        }\n**Timeline Segments:** ${
+                        }\n**Segments:** ${
                           toolCall.arguments.timeline?.length || 0
-                        }\n\n*This is happening client-side using FFmpeg.wasm*`,
+                        }\n\n*Client-side via FFmpeg.wasm*`,
                       }
                     : msg
                 )
@@ -223,9 +195,8 @@ export default function MovieMakerAgent() {
             }
           );
 
-          // Show tool result
           const resultMessage: Message = {
-            id: (Date.now() + 3).toString(),
+            id: (Date.now() + 100 + idx).toString(),
             role: "assistant",
             content: toolResult.success
               ? `✅ **${
@@ -244,46 +215,38 @@ export default function MovieMakerAgent() {
                   toolResult.data?.note
                     ? `📝 **Note:** ${toolResult.data.note}`
                     : ""
-                }\n\n🎉 Your video is ready! Check the file list or download it.`
+                }\n\n🎉 Your video is ready!`
               : `❌ **Error:** ${toolResult.error}\n\n${toolResult.message}`,
             timestamp: new Date(),
             toolResult: toolResult,
           };
           setMessages((prev) => [...prev, resultMessage]);
 
-          // Refresh the file list to show the new video
           if (toolResult.success && toolResult.data?.fileId) {
             const updatedFiles = await fileStorage.getFiles();
             setUploadedFiles(updatedFiles);
           }
-        } else {
-          console.log("[Chat] No toolCalls detected. Assistant content only.");
         }
 
         setIsLoading(false);
         return;
       }
 
-      // Regular streaming response (no tools)
-      const stream = await callGroqAPI(fullPrompt);
+      // No tool calls → stream regular content (send tools=true for consistency)
+      const stream = await callGroqAPI(fullPrompt, true);
 
       let assistantContent = "";
-      const assistantMessageId = (Date.now() + 1).toString();
-
-      // Add initial empty assistant message
-      const assistantMessage: Message = {
+      const assistantMessageId = (Date.now() + 1000).toString();
+      const assistantStreamingMsg: Message = {
         id: assistantMessageId,
         role: "assistant",
         content: "",
         timestamp: new Date(),
       };
-      setMessages((prev) => [...prev, assistantMessage]);
+      setMessages((prev) => [...prev, assistantStreamingMsg]);
 
-      // Stream chunks
       for await (const chunk of streamResponse(stream)) {
         assistantContent += chunk;
-
-        // Update the assistant message with accumulated content
         setMessages((prev) =>
           prev.map((msg) =>
             msg.id === assistantMessageId

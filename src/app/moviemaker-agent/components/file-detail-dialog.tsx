@@ -17,7 +17,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { formatDuration } from "../lib/transcription";
-import { Save, X } from "lucide-react";
+import { Save, X, Download } from "lucide-react";
 
 interface FileDetailDialogProps {
   file: UploadedFile | null;
@@ -64,6 +64,23 @@ export function FileDetailDialog({
       setHasChanges(false);
     }
     onOpenChange(false);
+  };
+
+  const handleDownload = () => {
+    if (!file) return;
+    try {
+      const blob = file.file;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file.name || "download";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (e) {
+      console.error("Failed to download file", e);
+    }
   };
 
   if (!file) return null;
@@ -191,6 +208,10 @@ export function FileDetailDialog({
         </div>
 
         <DialogFooter>
+          <Button variant="secondary" onClick={handleDownload}>
+            <Download className="h-4 w-4 mr-2" />
+            Download
+          </Button>
           <Button variant="outline" onClick={handleCancel}>
             <X className="h-4 w-4 mr-2" />
             Cancel

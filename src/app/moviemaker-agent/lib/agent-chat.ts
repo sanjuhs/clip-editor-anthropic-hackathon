@@ -350,12 +350,8 @@ export async function callGroqAPIWithTools(
     try {
       const candidates: Array<{ name?: string; arguments?: any }> = [];
 
-      // Extract JSON code blocks
-      const codeBlockMatches = Array.from(
-        text.matchAll(/```(?:json)?\n([\s\S]*?)```/gi)
-      );
-      for (const m of codeBlockMatches) {
-        const raw = m[1];
+      // Helper to try JSON parse and push candidate
+      const consider = (raw: string) => {
         try {
           const obj = JSON.parse(raw);
           if (obj && (obj.name || obj.tool || obj.toolName)) {
@@ -365,22 +361,38 @@ export async function callGroqAPIWithTools(
             });
           }
         } catch {}
+      };
+
+      // 1) Parse fenced code blocks (```json ... ```)
+      const codeBlockMatches = Array.from(
+        text.matchAll(/```(?:json)?\n([\s\S]*?)```/gi)
+      );
+      for (const m of codeBlockMatches) consider(m[1]);
+
+      // 2) Handle Markdown blockquotes: strip leading ">" and re-parse
+      if (candidates.length === 0) {
+        const dequoted = text.replace(/^\s*>\s?/gm, "");
+        const qCodeBlocks = Array.from(
+          dequoted.matchAll(/```(?:json)?\n([\s\S]*?)```/gi)
+        );
+        for (const m of qCodeBlocks) consider(m[1]);
+
+        if (qCodeBlocks.length === 0) {
+          // Try first JSON object in dequoted text
+          const firstBrace = dequoted.indexOf("{");
+          const lastBrace = dequoted.lastIndexOf("}");
+          if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+            consider(dequoted.slice(firstBrace, lastBrace + 1));
+          }
+        }
       }
 
-      // Fallback: first JSON object anywhere
+      // 3) As a final fallback, try first JSON object in original text
       if (candidates.length === 0) {
         const firstBrace = text.indexOf("{");
         const lastBrace = text.lastIndexOf("}");
         if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-          try {
-            const obj = JSON.parse(text.slice(firstBrace, lastBrace + 1));
-            if (obj && (obj.name || obj.tool || obj.toolName)) {
-              candidates.push({
-                name: obj.name || obj.tool || obj.toolName,
-                arguments: obj.arguments || obj.args || obj.parameters,
-              });
-            }
-          } catch {}
+          consider(text.slice(firstBrace, lastBrace + 1));
         }
       }
 

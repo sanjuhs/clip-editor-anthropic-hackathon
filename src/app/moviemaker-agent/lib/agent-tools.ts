@@ -352,6 +352,41 @@ function getOverlayPosition(
   }
 }
 
+/**
+ * Resample an AudioBuffer to target sample rate and channel count using OfflineAudioContext.
+ */
+async function resampleAudioBuffer(
+  input: AudioBuffer,
+  targetSampleRate: number,
+  targetChannelCount: number
+): Promise<AudioBuffer> {
+  // If already matching, return as-is
+  if (
+    input.sampleRate === targetSampleRate &&
+    input.numberOfChannels === targetChannelCount
+  ) {
+    return input;
+  }
+
+  const length = Math.max(1, Math.ceil(input.duration * targetSampleRate));
+  const offline = new (window.OfflineAudioContext ||
+    (window as any).webkitOfflineAudioContext)(
+    targetChannelCount,
+    length,
+    targetSampleRate
+  );
+
+  const src = offline.createBufferSource();
+  src.buffer = input;
+  // Use a gain node at unity to allow channel mixing if needed
+  const gain = offline.createGain();
+  gain.gain.value = 1.0;
+  src.connect(gain).connect(offline.destination);
+  src.start(0);
+  const rendered: AudioBuffer = await offline.startRendering();
+  return rendered;
+}
+
 // ============================================================================
 // CORE TOOL IMPLEMENTATIONS
 // ============================================================================
@@ -490,6 +525,10 @@ export async function concatenateSegments(
         const duration = Math.max(frame.duration || 1 / 30, 1 / 60);
         await videoSource.add(t, duration);
         t += duration;
+        try {
+          // Explicitly close the frame to avoid GC warnings and potential stalls
+          (frame as any).close?.();
+        } catch {}
         if (progressCallback) {
           const pct = Math.min(
             99,
@@ -504,7 +543,15 @@ export async function concatenateSegments(
     if (aTrack) {
       const aSink = new AudioBufferSink(aTrack);
       for await (const ab of aSink.buffers()) {
-        await audioSource.add(ab.buffer);
+        // Resample each incoming buffer to constant params to satisfy encoder
+        const AUDIO_TARGET_SAMPLE_RATE = 44100;
+        const AUDIO_TARGET_CHANNELS = 2;
+        const resampled = await resampleAudioBuffer(
+          ab.buffer,
+          AUDIO_TARGET_SAMPLE_RATE,
+          AUDIO_TARGET_CHANNELS
+        ).catch(() => ab.buffer);
+        await audioSource.add(resampled);
       }
     }
   }
@@ -588,6 +635,9 @@ export async function overlayAudio(
     const duration = Math.max(frame.duration || 1 / 30, 1 / 60);
     await videoSource.add(t, duration);
     t += duration;
+    try {
+      (frame as any).close?.();
+    } catch {}
   }
 
   // Add (trimmed) audio with volume scaling
@@ -598,20 +648,30 @@ export async function overlayAudio(
       audioTimeRange.end
     )) {
       const buf = ab.buffer;
-      // Scale volume in-place by copying
-      const ctxAudio = new (window.AudioContext ||
-        (window as any).webkitAudioContext)();
-      const out = ctxAudio.createBuffer(
-        buf.numberOfChannels,
-        buf.length,
-        buf.sampleRate
+      // Normalize audio format to satisfy encoder
+      const AUDIO_TARGET_SAMPLE_RATE = 44100;
+      const AUDIO_TARGET_CHANNELS = 2;
+      const normalized = await resampleAudioBuffer(
+        buf,
+        AUDIO_TARGET_SAMPLE_RATE,
+        AUDIO_TARGET_CHANNELS
+      ).catch(() => buf);
+
+      // Apply volume via OfflineAudioContext to avoid live AudioContext issues
+      const volCtx = new (window.OfflineAudioContext ||
+        (window as any).webkitOfflineAudioContext)(
+        normalized.numberOfChannels,
+        normalized.length,
+        normalized.sampleRate
       );
-      for (let ch = 0; ch < buf.numberOfChannels; ch++) {
-        const src = buf.getChannelData(ch);
-        const dst = out.getChannelData(ch);
-        for (let i = 0; i < src.length; i++) dst[i] = src[i] * volume;
-      }
-      await audioSource.add(out);
+      const src = volCtx.createBufferSource();
+      src.buffer = normalized;
+      const gain = volCtx.createGain();
+      gain.gain.value = volume;
+      src.connect(gain).connect(volCtx.destination);
+      src.start(0);
+      const volAdjusted = await volCtx.startRendering();
+      await audioSource.add(volAdjusted);
     }
   }
 
@@ -730,13 +790,23 @@ export async function overlayImage(
     const duration = Math.max(frame.duration || 1 / 30, 1 / 60);
     await videoSource.add(t, duration);
     t += duration;
+    try {
+      (frame as any).close?.();
+    } catch {}
   }
 
   // Copy audio if present
   if (audioSource && aTrack) {
     const aSink = new AudioBufferSink(aTrack);
     for await (const ab of aSink.buffers()) {
-      await audioSource.add(ab.buffer);
+      const AUDIO_TARGET_SAMPLE_RATE = 44100;
+      const AUDIO_TARGET_CHANNELS = 2;
+      const resampled = await resampleAudioBuffer(
+        ab.buffer,
+        AUDIO_TARGET_SAMPLE_RATE,
+        AUDIO_TARGET_CHANNELS
+      ).catch(() => ab.buffer);
+      await audioSource.add(resampled);
     }
   }
 
@@ -861,12 +931,22 @@ export async function overlayText(
     const duration = Math.max(frame.duration || 1 / 30, 1 / 60);
     await videoSource.add(t, duration);
     t += duration;
+    try {
+      (frame as any).close?.();
+    } catch {}
   }
 
   if (audioSource && aTrack) {
     const aSink = new AudioBufferSink(aTrack);
     for await (const ab of aSink.buffers()) {
-      await audioSource.add(ab.buffer);
+      const AUDIO_TARGET_SAMPLE_RATE = 44100;
+      const AUDIO_TARGET_CHANNELS = 2;
+      const resampled = await resampleAudioBuffer(
+        ab.buffer,
+        AUDIO_TARGET_SAMPLE_RATE,
+        AUDIO_TARGET_CHANNELS
+      ).catch(() => ab.buffer);
+      await audioSource.add(resampled);
     }
   }
 
