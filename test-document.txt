@@ -1,0 +1,24 @@
+Sample Test Document
+
+This is a test document to verify that document processing is working correctly in the Movie Maker Agent application.
+
+Key Features Being Tested:
+- Text extraction from plain text files
+- Word count and character count analysis
+- Summary generation
+- Raw text storage for indexing
+
+This document should be processed automatically when uploaded. The system will:
+1. Extract all the text content
+2. Analyze the document structure (words, characters, lines, paragraphs)
+3. Generate a summary based on the first few sentences
+4. Store both the summary and full text for indexing
+
+Additional Testing Notes:
+- The summary should appear in the table view
+- The raw text should be viewable in the detail dialog
+- The indexed status should show as "Indexed" with a green checkmark
+- File statistics should be displayed in the success message
+
+End of test document.
+

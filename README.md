@@ -174,3 +174,7 @@ Then it should arrange all teh clips together to get the final video.
 then it hsould add subtitles and then add it to the video.
 
 then finalyl render the video to the user.
+
+http://localhost:3000/moviemaker-agent
+
+image.png

@@ -45,16 +45,22 @@ export interface TranscriptionOptions {
   temperature?: number;
   model?: "whisper-large-v3-turbo" | "whisper-large-v3";
   timestampGranularities?: ("word" | "segment")[];
+  onProgress?: (progress: {
+    current: number;
+    total: number;
+    percentage: number;
+  }) => void;
 }
 
 /**
- * Transcribe an audio file using Groq's Whisper API
+ * Transcribe a single audio chunk
  */
-export async function transcribeAudio(
-  options: TranscriptionOptions
+async function transcribeChunk(
+  file: File | Blob,
+  fileName: string,
+  options: Omit<TranscriptionOptions, "file" | "onProgress">
 ): Promise<TranscriptionResponse> {
   const {
-    file,
     language,
     prompt,
     responseFormat = "verbose_json",
@@ -64,7 +70,7 @@ export async function transcribeAudio(
   } = options;
 
   const formData = new FormData();
-  formData.append("file", file);
+  formData.append("file", file, fileName);
   formData.append("response_format", responseFormat);
   formData.append("temperature", temperature.toString());
   formData.append("model", model);
@@ -92,6 +98,149 @@ export async function transcribeAudio(
   }
 
   return response.json();
+}
+
+/**
+ * Merge multiple transcription responses into one
+ */
+function mergeTranscriptions(
+  chunks: Array<{ transcription: TranscriptionResponse; startTime: number }>
+): TranscriptionResponse {
+  const merged: TranscriptionResponse = {
+    success: true,
+    transcription: {
+      text: "",
+      task: chunks[0]?.transcription.transcription.task,
+      language: chunks[0]?.transcription.transcription.language,
+      duration: 0,
+      segments: [],
+      words: [],
+    },
+    metadata: {
+      ...chunks[0]?.transcription.metadata,
+      fileName: chunks[0]?.transcription.metadata.fileName.replace(
+        /_chunk_\d+/,
+        ""
+      ),
+    },
+  };
+
+  let textParts: string[] = [];
+
+  for (const { transcription, startTime } of chunks) {
+    const trans = transcription.transcription;
+
+    // Merge text
+    if (trans.text) {
+      textParts.push(trans.text.trim());
+    }
+
+    // Merge segments with time offset
+    if (trans.segments) {
+      for (const segment of trans.segments) {
+        merged.transcription.segments!.push({
+          ...segment,
+          start: segment.start + startTime,
+          end: segment.end + startTime,
+        });
+      }
+    }
+
+    // Merge words with time offset
+    if (trans.words) {
+      for (const word of trans.words) {
+        merged.transcription.words!.push({
+          ...word,
+          start: word.start + startTime,
+          end: word.end + startTime,
+        });
+      }
+    }
+
+    // Update duration
+    if (trans.duration) {
+      merged.transcription.duration = startTime + trans.duration;
+    }
+  }
+
+  merged.transcription.text = textParts.join(" ");
+
+  return merged;
+}
+
+/**
+ * Transcribe an audio file using Groq's Whisper API
+ * Automatically chunks large files to avoid size limits
+ */
+export async function transcribeAudio(
+  options: TranscriptionOptions
+): Promise<TranscriptionResponse> {
+  const { file, onProgress, ...transcriptionOptions } = options;
+
+  const fileSizeMB = file.size / (1024 * 1024);
+  console.log(
+    `[Transcription] File: ${file.name}, Size: ${fileSizeMB.toFixed(2)}MB`
+  );
+
+  // Check file size - Groq free tier limit is 25MB, we use 20MB to be safe
+  const maxFileSize = 20 * 1024 * 1024; // 20MB
+
+  if (file.size <= maxFileSize) {
+    console.log(
+      `[Transcription] File is small enough (${fileSizeMB.toFixed(
+        2
+      )}MB <= 20MB), transcribing directly`
+    );
+    // File is small enough, transcribe directly
+    return transcribeChunk(file, file.name, transcriptionOptions);
+  }
+
+  console.log(
+    `[Transcription] File is too large (${fileSizeMB.toFixed(
+      2
+    )}MB > 20MB), chunking required`
+  );
+
+  // File is too large, need to chunk it
+  const { splitAudioIntoChunks } = await import("./audio-chunker");
+  const chunks = await splitAudioIntoChunks(file, 20); // 20MB max per chunk
+
+  const transcriptions: Array<{
+    transcription: TranscriptionResponse;
+    startTime: number;
+  }> = [];
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+
+    // Report progress
+    if (onProgress) {
+      onProgress({
+        current: i + 1,
+        total: chunks.length,
+        percentage: Math.round(((i + 1) / chunks.length) * 100),
+      });
+    }
+
+    // Transcribe chunk
+    const chunkFileName = `${file.name.replace(
+      /\.[^/.]+$/,
+      ""
+    )}_chunk_${i}.wav`;
+    const transcription = await transcribeChunk(
+      chunk.blob,
+      chunkFileName,
+      transcriptionOptions
+    );
+
+    transcriptions.push({
+      transcription,
+      startTime: chunk.startTime,
+    });
+  }
+
+  // Merge all transcriptions
+  return mergeTranscriptions(transcriptions);
 }
 
 /**

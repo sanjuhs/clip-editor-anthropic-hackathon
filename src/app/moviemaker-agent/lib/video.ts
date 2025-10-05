@@ -1,13 +1,52 @@
 "use client";
 
+import { TranscriptionSegment } from "./transcription";
+
 /**
- * Extract a frame every 1s from a video File. Caps at maxSeconds if provided.
+ * Calculate adaptive interval to target ~100 frames max.
+ * For videos < 100s: 1 frame/sec
+ * For videos 100-300s: 1 frame every 2-3 secs
+ * For videos > 300s: adjust to keep around 100 frames
  */
-export async function extractFramesPerSecond(
+export function calculateAdaptiveInterval(durationSeconds: number): number {
+  const targetFrames = 100;
+  if (durationSeconds <= targetFrames) return 1; // 1 frame/sec
+  return Math.ceil(durationSeconds / targetFrames);
+}
+
+/**
+ * Extract keyframe timestamps from transcript segments.
+ * Takes the start of each segment as a keyframe opportunity.
+ */
+export function extractKeyframeTimestampsFromSegments(
+  segments: TranscriptionSegment[],
+  videoDuration: number
+): number[] {
+  if (!segments || segments.length === 0) return [];
+
+  const timestamps = segments.map((seg) => Math.floor(seg.start));
+  // Add the last frame at the end
+  timestamps.push(Math.floor(videoDuration));
+
+  // Deduplicate and sort
+  return [...new Set(timestamps)].sort((a, b) => a - b);
+}
+
+/**
+ * Smart keyframe extraction:
+ * 1. If transcript available: extract at segment boundaries
+ * 2. If not enough frames (< 30): supplement with adaptive interval sampling
+ * 3. Cap at ~100 frames total
+ */
+export async function extractSmartKeyframes(
   file: File,
-  options?: { maxSeconds?: number; quality?: number }
+  options?: {
+    quality?: number;
+    segments?: TranscriptionSegment[];
+    maxFrames?: number;
+  }
 ): Promise<Array<{ second: number; dataUrl: string }>> {
-  const { maxSeconds = 120, quality = 0.8 } = options || {};
+  const { quality = 0.7, segments, maxFrames = 100 } = options || {};
 
   const url = URL.createObjectURL(file);
   try {
@@ -16,7 +55,7 @@ export async function extractFramesPerSecond(
     video.crossOrigin = "anonymous";
     video.muted = true;
 
-    // Ensure metadata is loaded for duration and dimensions
+    // Load metadata
     await new Promise<void>((resolve, reject) => {
       const onLoaded = () => resolve();
       const onError = () => reject(new Error("Failed to load video metadata"));
@@ -35,12 +74,41 @@ export async function extractFramesPerSecond(
     const ctx = canvas.getContext("2d");
     if (!ctx) return [];
 
-    const frames: Array<{ second: number; dataUrl: string }> = [];
-    const lastSecond = Math.min(duration, maxSeconds);
+    // Determine timestamps to extract
+    let timestamps: number[] = [];
 
-    for (let t = 0; t <= lastSecond; t += 1) {
-      // Seek video to time t
-      // Some browsers require slight offsets to ensure seek triggers
+    // Strategy 1: Use transcript segments if available
+    if (segments && segments.length > 0) {
+      timestamps = extractKeyframeTimestampsFromSegments(segments, duration);
+    }
+
+    // Strategy 2: If we have too few frames, supplement with adaptive sampling
+    const minFrames = 30;
+    if (timestamps.length < minFrames) {
+      const interval = calculateAdaptiveInterval(duration);
+      const additionalTimestamps: number[] = [];
+      for (let t = 0; t <= duration; t += interval) {
+        additionalTimestamps.push(t);
+      }
+      // Merge and deduplicate
+      timestamps = [...new Set([...timestamps, ...additionalTimestamps])].sort(
+        (a, b) => a - b
+      );
+    }
+
+    // Cap at maxFrames
+    if (timestamps.length > maxFrames) {
+      // Sample evenly from the timestamps
+      const step = timestamps.length / maxFrames;
+      timestamps = Array.from(
+        { length: maxFrames },
+        (_, i) => timestamps[Math.floor(i * step)]
+      );
+    }
+
+    // Extract frames
+    const frames: Array<{ second: number; dataUrl: string }> = [];
+    for (const t of timestamps) {
       const seekTime = Math.min(t + 0.0001, video.duration);
       await new Promise<void>((resolve) => {
         const onSeeked = () => resolve();
@@ -65,44 +133,157 @@ export interface FrameCaption {
 }
 
 /**
- * Describe frames via Groq Llama Vision (faster than Moondream).
- * Sequential to avoid hammering the API.
+ * Describe frames via Groq Llama Vision with intelligent batching.
+ * Batches multiple frames (default 5) per API call for efficiency.
+ * Processes batches in parallel for speed while respecting rate limits.
+ *
+ * NOTE: Groq Llama Vision API supports a maximum of 5 images per request.
+ * Do not set batchSize higher than 5.
  */
 export async function describeFrames(
-  frames: Array<{ second: number; dataUrl: string }>
+  frames: Array<{ second: number; dataUrl: string }>,
+  options?: {
+    batchSize?: number; // Number of frames to send per API call (max 5 for Groq)
+    parallelBatches?: number; // Number of batches to process in parallel
+  }
 ): Promise<FrameCaption[]> {
+  const { batchSize = 5, parallelBatches = 3 } = options || {};
+
+  // Cap batch size at 5 (Groq API limitation)
+  const safeBatchSize = Math.min(batchSize, 5);
+
+  // Split frames into batches
+  const batches: Array<Array<{ second: number; dataUrl: string }>> = [];
+  for (let i = 0; i < frames.length; i += safeBatchSize) {
+    batches.push(frames.slice(i, i + safeBatchSize));
+  }
+
   const results: FrameCaption[] = [];
-  for (const frame of frames) {
-    try {
-      const res = await fetch("/api/groq-llama-vision", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          messages: [
-            {
-              role: "user",
-              content: [
-                {
-                  type: "image_url",
-                  image_url: { url: frame.dataUrl },
-                },
-                {
-                  type: "text",
-                  text: "Describe this video frame in one concise sentence.",
-                },
-              ],
-            },
-          ],
-          stream: false,
-        }),
+
+  // Process batches in parallel (with controlled concurrency)
+  for (let i = 0; i < batches.length; i += parallelBatches) {
+    const batchGroup = batches.slice(i, i + parallelBatches);
+
+    const batchPromises = batchGroup.map(async (batch) => {
+      return await describeBatch(batch);
+    });
+
+    const batchResults = await Promise.all(batchPromises);
+    results.push(...batchResults.flat());
+  }
+
+  return results;
+}
+
+/**
+ * Describe a batch of frames in a single API call.
+ * Sends multiple images together so the model can understand temporal flow.
+ */
+async function describeBatch(
+  batch: Array<{ second: number; dataUrl: string }>
+): Promise<FrameCaption[]> {
+  if (batch.length === 0) return [];
+
+  try {
+    // Build content array with all images + text prompt
+    const content: Array<{
+      type: string;
+      image_url?: { url: string };
+      text?: string;
+    }> = [];
+
+    // Add all images first
+    batch.forEach((frame, idx) => {
+      content.push({
+        type: "image_url",
+        image_url: { url: frame.dataUrl },
       });
-      const json = await res.json();
-      const caption = json?.response || "";
-      results.push({ second: frame.second, caption });
-    } catch (e) {
-      results.push({ second: frame.second, caption: "" });
+    });
+
+    // Add comprehensive prompt at the end
+    const timeRangeText =
+      batch.length > 1
+        ? `from ${batch[0].second}s to ${batch[batch.length - 1].second}s`
+        : `at ${batch[0].second}s`;
+
+    content.push({
+      type: "text",
+      text: `You are analyzing ${batch.length} sequential video frames ${timeRangeText}. 
+For each frame in order, provide a concise one-sentence description focusing on:
+- Main subjects and actions
+- Significant changes from the previous frame (if any)
+- Key visual elements
+
+Format your response as a numbered list (1, 2, 3...) with one description per frame.
+Be concise but capture important details and transitions.`,
+    });
+
+    const res = await fetch("/api/groq-llama-vision", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: [
+          {
+            role: "user",
+            content,
+          },
+        ],
+        stream: false,
+      }),
+    });
+
+    const json = await res.json();
+    const response = json?.response || "";
+
+    // Parse the numbered response back into individual captions
+    return parseBatchResponse(response, batch);
+  } catch (e) {
+    console.error("Batch description error:", e);
+    // Return empty captions for failed batch
+    return batch.map((frame) => ({ second: frame.second, caption: "" }));
+  }
+}
+
+/**
+ * Parse the batched response into individual frame captions.
+ * Expects numbered format like "1. Description\n2. Description\n..."
+ */
+function parseBatchResponse(
+  response: string,
+  batch: Array<{ second: number; dataUrl: string }>
+): FrameCaption[] {
+  const lines = response.split(/\n+/).filter((line) => line.trim());
+  const results: FrameCaption[] = [];
+
+  // Try to extract numbered descriptions
+  const numberedPattern = /^\s*(\d+)[.)]\s*(.+)/;
+
+  let captionIndex = 0;
+  for (const line of lines) {
+    const match = line.match(numberedPattern);
+    if (match && captionIndex < batch.length) {
+      const description = match[2].trim();
+      results.push({
+        second: batch[captionIndex].second,
+        caption: description,
+      });
+      captionIndex++;
     }
   }
+
+  // If parsing failed or incomplete, fall back to splitting by sentences
+  if (results.length < batch.length) {
+    const sentences = response
+      .split(/[.!?]+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+
+    return batch.map((frame, idx) => ({
+      second: frame.second,
+      caption: sentences[idx] || "",
+    }));
+  }
+
   return results;
 }
 
@@ -151,4 +332,70 @@ export function buildSummary(
   return (
     parts.join(" ").trim() || "Generated combined summary of audio and visuals."
   );
+}
+
+/**
+ * Describe a single image using Groq Llama Vision
+ */
+export async function describeImage(
+  dataUrl: string
+): Promise<{ description: string; detailedAnalysis: string }> {
+  try {
+    // Get short description
+    const shortRes = await fetch("/api/groq-llama-vision", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "image_url",
+                image_url: { url: dataUrl },
+              },
+              {
+                type: "text",
+                text: "Describe this image in one concise sentence.",
+              },
+            ],
+          },
+        ],
+        stream: false,
+      }),
+    });
+    const shortJson = await shortRes.json();
+    const description = shortJson?.response || "";
+
+    // Get detailed analysis
+    const detailRes = await fetch("/api/groq-llama-vision", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "image_url",
+                image_url: { url: dataUrl },
+              },
+              {
+                type: "text",
+                text: "Provide a detailed analysis of this image including: objects, people, colors, composition, mood, and any text visible. Be thorough.",
+              },
+            ],
+          },
+        ],
+        stream: false,
+      }),
+    });
+    const detailJson = await detailRes.json();
+    const detailedAnalysis = detailJson?.response || "";
+
+    return { description, detailedAnalysis };
+  } catch (e) {
+    console.error("Image description error:", e);
+    return { description: "", detailedAnalysis: "" };
+  }
 }

@@ -2,6 +2,8 @@
 
 import { useState, useRef, useEffect } from "react";
 import Link from "next/link";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ArrowLeft, Send, Sparkles, Upload, Video, Menu } from "lucide-react";
@@ -14,18 +16,26 @@ import { UploadedFile, ViewMode } from "./types";
 import { fileStorage } from "./lib/indexeddb";
 import { transcribeAudio } from "./lib/transcription";
 import {
-  extractFramesPerSecond,
+  extractSmartKeyframes,
   describeFrames,
   buildCombinedRawText,
   buildSummary,
+  describeImage,
 } from "./lib/video";
-
-interface Message {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  timestamp: Date;
-}
+import {
+  extractTextFromDocument,
+  summarizeDocument,
+  analyzeDocumentStructure,
+} from "./lib/document";
+import {
+  Message,
+  searchRelevantFiles,
+  buildContextFromFiles,
+  buildFullPrompt,
+  callGroqAPI,
+  callGroqAPIWithTools,
+  streamResponse,
+} from "./lib/agent-chat";
 
 export default function MovieMakerAgent() {
   const [messages, setMessages] = useState<Message[]>([
@@ -33,7 +43,7 @@ export default function MovieMakerAgent() {
       id: "welcome",
       role: "assistant",
       content:
-        "Hello! I'm your Movie Maker Agent. I can help you transform your long-form videos into engaging short clips perfect for social media.\n\nWhat would you like to create today?",
+        "Hello! I'm your Movie Maker AI Agent. I can help you transform your long-form content into engaging short clips perfect for social media.\n\n**What I can do:**\n• Analyze your uploaded videos, audio, documents, and images\n• Answer questions about your content\n• Identify key moments and highlights from transcripts\n• Create detailed editing timelines with exact timestamps from your assets\n• Provide TWO clip options: one using only your current files, and one with suggestions for additional assets\n• Generate complete video editing plans with video, audio, picture overlays, and text overlay specifications\n\n**My clip suggestions include:**\n• **File Reference Table** - Clear mapping of File 1, File 2, etc. to actual filenames\n• **Detailed Timeline Table** - Showing exactly when to use which asset\n• **Video Assets** - Which file and precise timestamps to extract from\n• **Audio Assets** - What audio to use and when (can mix from different files)\n• **Picture Overlays** - Logos, graphics, or images to overlay on video with position (top-left, center, etc.)\n• **Text Overlays** - What text to display, when, and where\n• **Creative Rationale** - Why each choice works for engagement\n\n**To get started:**\n1. Upload your files using the upload button below\n2. I'll automatically transcribe and analyze them\n3. Ask me to suggest clip ideas or ask questions about your content\n\nWhat would you like to create today?",
       timestamp: new Date(),
     },
   ]);
@@ -67,6 +77,25 @@ export default function MovieMakerAgent() {
     scrollToBottom();
   }, [messages]);
 
+  // Debug: expose a manual composeVideo runner in the browser console
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      (window as any).__runComposeVideoDebug = async (args: any) => {
+        console.log("__runComposeVideoDebug called with:", args);
+        const { executeToolCall } = await import("./lib/agent-tools");
+        const result = await executeToolCall(
+          "composeVideo",
+          args,
+          (stage, progress) =>
+            console.log(`[DEBUG composeVideo] ${stage}: ${progress}%`)
+        );
+        console.log("__runComposeVideoDebug result:", result);
+        return result;
+      };
+      console.log("Registered window.__runComposeVideoDebug(args)");
+    }
+  }, []);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim() || isLoading) return;
@@ -79,21 +108,204 @@ export default function MovieMakerAgent() {
     };
 
     setMessages((prev) => [...prev, userMessage]);
+    const currentInput = input.trim();
     setInput("");
     setIsLoading(true);
 
-    // Simulate AI response (replace with actual AI integration later)
-    setTimeout(() => {
+    try {
+      // Search for relevant files based on user query
+      const relevantFiles = searchRelevantFiles(currentInput, uploadedFiles);
+      const filesContext = buildContextFromFiles(relevantFiles);
+
+      // Build the full prompt with context and conversation history
+      const fullPrompt = buildFullPrompt(currentInput, filesContext, messages);
+
+      // First, check if tools should be used (detect keywords like "create", "make", "generate")
+      const shouldCheckTools =
+        currentInput.toLowerCase().includes("create") ||
+        currentInput.toLowerCase().includes("make") ||
+        currentInput.toLowerCase().includes("generate") ||
+        currentInput.toLowerCase().includes("yes") ||
+        currentInput.toLowerCase().includes("option");
+
+      if (shouldCheckTools) {
+        console.log(
+          "[Chat] shouldCheckTools = true; calling callGroqAPIWithTools"
+        );
+        // Call non-streaming API to check for tool calls
+        const response = await callGroqAPIWithTools(
+          [
+            ...messages.map((m) => ({
+              role: m.role,
+              content: m.content,
+            })),
+            { role: "user", content: currentInput },
+          ],
+          uploadedFiles
+        );
+
+        console.log("[Chat] callGroqAPIWithTools response:", response);
+
+        // Add assistant message
+        const assistantMessage: Message = {
+          id: (Date.now() + 1).toString(),
+          role: "assistant",
+          content: response.content || "Processing your request...",
+          timestamp: new Date(),
+        };
+        setMessages((prev) => [...prev, assistantMessage]);
+
+        // Check if there are tool calls
+        if (response.toolCalls && response.toolCalls.length > 0) {
+          const toolCall = response.toolCalls[0];
+          console.log("[Chat] Detected tool call:", toolCall);
+
+          // Show tool execution message with initial progress
+          const toolMessage: Message = {
+            id: (Date.now() + 2).toString(),
+            role: "assistant",
+            content: `🎬 **Starting Video Processing**\n\n⏳ Initializing MediaBunny (FFmpeg.wasm)...\n\n*Progress: 0%*\n\n---\n\n**Tool:** ${
+              toolCall.name
+            }\n**Timeline Segments:** ${
+              toolCall.arguments.timeline?.length || 0
+            }`,
+            timestamp: new Date(),
+          };
+          setMessages((prev) => [...prev, toolMessage]);
+
+          console.log(
+            "executeToolCall is in progress!!!v0.01",
+            toolCall.name,
+            toolCall.arguments
+          );
+
+          // Execute the tool with detailed progress tracking
+          const { executeToolCall } = await import("./lib/agent-tools");
+          console.log("[Chat] Imported executeToolCall");
+
+          let currentStage = "Initializing";
+          let currentProgress = 0;
+
+          console.log(
+            "executeToolCall is in progress!!!v0.02",
+            toolCall.name,
+            toolCall.arguments
+          );
+          const toolResult = await executeToolCall(
+            toolCall.name,
+            toolCall.arguments,
+            (stage, progress) => {
+              currentStage = stage;
+              currentProgress = Math.round(progress);
+
+              console.log(`🎬 ${stage}: ${currentProgress}%`);
+
+              // Create a progress bar
+              const progressBar =
+                "█".repeat(Math.floor(currentProgress / 5)) +
+                "░".repeat(20 - Math.floor(currentProgress / 5));
+
+              // Update the tool message with detailed progress
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === toolMessage.id
+                    ? {
+                        ...msg,
+                        content: `🎬 **Video Processing in Progress**\n\n**Current Stage:** ${stage}\n\n[\`${progressBar}\`] ${currentProgress}%\n\n---\n\n**Tool:** ${
+                          toolCall.name
+                        }\n**Timeline Segments:** ${
+                          toolCall.arguments.timeline?.length || 0
+                        }\n\n*This is happening client-side using FFmpeg.wasm*`,
+                      }
+                    : msg
+                )
+              );
+            }
+          );
+
+          // Show tool result
+          const resultMessage: Message = {
+            id: (Date.now() + 3).toString(),
+            role: "assistant",
+            content: toolResult.success
+              ? `✅ **${
+                  toolResult.message
+                }**\n\n📹 **Video Details:**\n- **File Name:** ${
+                  toolResult.data?.fileName || "Unknown"
+                }\n- **Size:** ${
+                  toolResult.data?.sizeMB || "Unknown"
+                } MB\n- **Duration:** ${
+                  toolResult.data?.duration || 0
+                }s\n- **Segments Processed:** ${
+                  toolResult.data?.trimmedSegments || 0
+                }\n\n💾 **Saved to:** IndexedDB (File ID: \`${
+                  toolResult.data?.fileId
+                }\`)\n\n${
+                  toolResult.data?.note
+                    ? `📝 **Note:** ${toolResult.data.note}`
+                    : ""
+                }\n\n🎉 Your video is ready! Check the file list or download it.`
+              : `❌ **Error:** ${toolResult.error}\n\n${toolResult.message}`,
+            timestamp: new Date(),
+            toolResult: toolResult,
+          };
+          setMessages((prev) => [...prev, resultMessage]);
+
+          // Refresh the file list to show the new video
+          if (toolResult.success && toolResult.data?.fileId) {
+            const updatedFiles = await fileStorage.getFiles();
+            setUploadedFiles(updatedFiles);
+          }
+        } else {
+          console.log("[Chat] No toolCalls detected. Assistant content only.");
+        }
+
+        setIsLoading(false);
+        return;
+      }
+
+      // Regular streaming response (no tools)
+      const stream = await callGroqAPI(fullPrompt);
+
+      let assistantContent = "";
+      const assistantMessageId = (Date.now() + 1).toString();
+
+      // Add initial empty assistant message
       const assistantMessage: Message = {
-        id: (Date.now() + 1).toString(),
+        id: assistantMessageId,
         role: "assistant",
-        content:
-          "I understand you want to work with video content. I'm currently in development mode, but soon I'll be able to help you:\n\n• Analyze your video content\n• Identify key moments and highlights\n• Generate optimized clips for different platforms\n• Add captions and effects\n\nStay tuned for more features!",
+        content: "",
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, assistantMessage]);
+
+      // Stream chunks
+      for await (const chunk of streamResponse(stream)) {
+        assistantContent += chunk;
+
+        // Update the assistant message with accumulated content
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg.id === assistantMessageId
+              ? { ...msg, content: assistantContent }
+              : msg
+          )
+        );
+      }
+
       setIsLoading(false);
-    }, 1000);
+    } catch (error: any) {
+      console.error("Chat error:", error);
+
+      const errorMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        role: "assistant",
+        content: `❌ Sorry, I encountered an error: ${error.message}\n\nPlease make sure the API is properly configured and try again.`,
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, errorMessage]);
+      setIsLoading(false);
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -157,21 +369,39 @@ export default function MovieMakerAgent() {
     for (const uploadedFile of files) {
       if (uploadedFile.type === "audio" || uploadedFile.type === "video") {
         // Notify user that transcription is starting
+        const fileSizeMB = (uploadedFile.size / (1024 * 1024)).toFixed(2);
         const transcriptStartMessage: Message = {
           id: `${Date.now()}-transcript-start`,
           role: "assistant",
-          content: `🎙️ Starting transcription for "${uploadedFile.name}"...`,
+          content: `🎙️ Starting transcription for "${uploadedFile.name}" (${fileSizeMB}MB)...`,
           timestamp: new Date(),
         };
         setMessages((prev) => [...prev, transcriptStartMessage]);
 
         try {
-          // Transcribe the audio
+          // Transcribe the audio with progress tracking
           const transcription = await transcribeAudio({
             file: uploadedFile.file,
             model: "whisper-large-v3-turbo",
             responseFormat: "verbose_json",
             timestampGranularities: ["word", "segment"],
+            onProgress: (progress) => {
+              // Update progress message
+              const progressMsg: Message = {
+                id: `${Date.now()}-progress-${progress.current}`,
+                role: "assistant",
+                content: `📝 Transcribing chunk ${progress.current}/${progress.total} (${progress.percentage}%)...`,
+                timestamp: new Date(),
+              };
+              setMessages((prev) => {
+                // Replace last progress message or add new one
+                const lastMsg = prev[prev.length - 1];
+                if (lastMsg?.content.includes("Transcribing chunk")) {
+                  return [...prev.slice(0, -1), progressMsg];
+                }
+                return [...prev, progressMsg];
+              });
+            },
           });
 
           // If video, extract keyframes and generate visual captions
@@ -180,13 +410,24 @@ export default function MovieMakerAgent() {
 
           if (uploadedFile.type === "video") {
             try {
-              const approxDuration = Math.floor(
-                transcription.transcription.duration || 0
-              );
-              const frames = await extractFramesPerSecond(uploadedFile.file, {
-                maxSeconds: approxDuration > 0 ? approxDuration : 60,
+              // Use smart keyframe extraction with transcript segments
+              const frames = await extractSmartKeyframes(uploadedFile.file, {
                 quality: 0.7,
+                segments: transcription.transcription.segments,
+                maxFrames: 100,
               });
+
+              const frameCount = frames.length;
+              const statusMsg: Message = {
+                id: `${Date.now()}-frames`,
+                role: "assistant",
+                content: `📸 Extracted ${frameCount} keyframes. Analyzing visuals...`,
+                timestamp: new Date(),
+              };
+              setMessages((prev) => [...prev, statusMsg]);
+
+              // NOTE: Groq Llama Vision API supports max 5 images per request
+              // describeFrames batches frames in groups of 5 and processes them in parallel
               const captions = await describeFrames(frames);
               combinedRawText = buildCombinedRawText(
                 transcription.transcription.text,
@@ -271,8 +512,141 @@ export default function MovieMakerAgent() {
           };
           setMessages((prev) => [...prev, errorMessage]);
         }
+      } else if (uploadedFile.type === "image") {
+        // Process images with visual analysis
+        const imageStartMessage: Message = {
+          id: `${Date.now()}-image-start`,
+          role: "assistant",
+          content: `🖼️ Analyzing image "${uploadedFile.name}"...`,
+          timestamp: new Date(),
+        };
+        setMessages((prev) => [...prev, imageStartMessage]);
+
+        try {
+          // Convert File to data URL
+          const reader = new FileReader();
+          const dataUrl = await new Promise<string>((resolve, reject) => {
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = reject;
+            reader.readAsDataURL(uploadedFile.file);
+          });
+
+          // Get image descriptions
+          const { description, detailedAnalysis } = await describeImage(
+            dataUrl
+          );
+
+          // Update file with image data
+          const updatedFile: UploadedFile = {
+            ...uploadedFile,
+            summary: description,
+            rawText: detailedAnalysis,
+            indexed: true,
+            imageDescription: {
+              shortDescription: description,
+              detailedAnalysis: detailedAnalysis,
+            },
+          };
+
+          await fileStorage.updateFile(updatedFile);
+          setUploadedFiles((prev) =>
+            prev.map((f) => (f.id === uploadedFile.id ? updatedFile : f))
+          );
+
+          // Notify success
+          const imageDoneMessage: Message = {
+            id: `${Date.now()}-image-done`,
+            role: "assistant",
+            content: `✅ Image analysis complete for "${uploadedFile.name}"!\n\n**Summary:** ${description}`,
+            timestamp: new Date(),
+          };
+          setMessages((prev) => [...prev, imageDoneMessage]);
+        } catch (error: any) {
+          console.error("Image analysis error:", error);
+
+          const failedFile: UploadedFile = {
+            ...uploadedFile,
+            indexed: false,
+            summary: `Image analysis failed: ${error.message}`,
+          };
+          await fileStorage.updateFile(failedFile);
+          setUploadedFiles((prev) =>
+            prev.map((f) => (f.id === uploadedFile.id ? failedFile : f))
+          );
+
+          const errorMessage: Message = {
+            id: `${Date.now()}-image-error`,
+            role: "assistant",
+            content: `❌ Failed to analyze "${uploadedFile.name}": ${error.message}`,
+            timestamp: new Date(),
+          };
+          setMessages((prev) => [...prev, errorMessage]);
+        }
+      } else if (uploadedFile.type === "document") {
+        // Process documents with text extraction
+        const docStartMessage: Message = {
+          id: `${Date.now()}-doc-start`,
+          role: "assistant",
+          content: `📄 Processing document "${uploadedFile.name}"...`,
+          timestamp: new Date(),
+        };
+        setMessages((prev) => [...prev, docStartMessage]);
+
+        try {
+          // Extract text from document
+          const { text, preview } = await extractTextFromDocument(
+            uploadedFile.file
+          );
+
+          // Analyze document structure
+          const stats = analyzeDocumentStructure(text);
+
+          // Generate summary
+          const summary = await summarizeDocument(text, uploadedFile.name);
+
+          // Update file with document data
+          const updatedFile: UploadedFile = {
+            ...uploadedFile,
+            summary: summary,
+            rawText: text,
+            indexed: true,
+          };
+
+          await fileStorage.updateFile(updatedFile);
+          setUploadedFiles((prev) =>
+            prev.map((f) => (f.id === uploadedFile.id ? updatedFile : f))
+          );
+
+          // Notify success
+          const docDoneMessage: Message = {
+            id: `${Date.now()}-doc-done`,
+            role: "assistant",
+            content: `✅ Document processed successfully!\n\n**File:** ${uploadedFile.name}\n**Statistics:**\n• Words: ${stats.wordCount}\n• Characters: ${stats.charCount}\n• Lines: ${stats.lineCount}\n• Paragraphs: ${stats.paragraphCount}\n\n**Preview:**\n"${preview}..."`,
+            timestamp: new Date(),
+          };
+          setMessages((prev) => [...prev, docDoneMessage]);
+        } catch (error: any) {
+          console.error("Document processing error:", error);
+
+          const failedFile: UploadedFile = {
+            ...uploadedFile,
+            indexed: false,
+            summary: `Document processing failed: ${error.message}`,
+          };
+          await fileStorage.updateFile(failedFile);
+          setUploadedFiles((prev) =>
+            prev.map((f) => (f.id === uploadedFile.id ? failedFile : f))
+          );
+
+          const errorMessage: Message = {
+            id: `${Date.now()}-doc-error`,
+            role: "assistant",
+            content: `❌ Failed to process "${uploadedFile.name}": ${error.message}`,
+            timestamp: new Date(),
+          };
+          setMessages((prev) => [...prev, errorMessage]);
+        }
       }
-      // TODO: Add processing for images, videos, and documents
     }
   };
 
@@ -329,17 +703,20 @@ export default function MovieMakerAgent() {
       );
 
       // Notify user
+      const fileSizeMB = (fileToRetranscribe.size / (1024 * 1024)).toFixed(2);
       const startMessage: Message = {
         id: `${Date.now()}-retranscribe-start`,
         role: "assistant",
-        content: `🎙️ Re-transcribing "${fileToRetranscribe.name}"${
+        content: `🎙️ Re-transcribing "${
+          fileToRetranscribe.name
+        }" (${fileSizeMB}MB)${
           language ? ` as ${language.toUpperCase()}` : ""
         }...`,
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, startMessage]);
 
-      // Start transcription
+      // Start transcription with progress
       try {
         const transcription = await transcribeAudio({
           file: fileToRetranscribe.file,
@@ -348,6 +725,21 @@ export default function MovieMakerAgent() {
           timestampGranularities: ["word", "segment"],
           language,
           prompt,
+          onProgress: (progress) => {
+            const progressMsg: Message = {
+              id: `${Date.now()}-retrans-progress-${progress.current}`,
+              role: "assistant",
+              content: `📝 Re-transcribing chunk ${progress.current}/${progress.total} (${progress.percentage}%)...`,
+              timestamp: new Date(),
+            };
+            setMessages((prev) => {
+              const lastMsg = prev[prev.length - 1];
+              if (lastMsg?.content.includes("Re-transcribing chunk")) {
+                return [...prev.slice(0, -1), progressMsg];
+              }
+              return [...prev, progressMsg];
+            });
+          },
         });
 
         // Update the file with new transcript
@@ -399,16 +791,21 @@ export default function MovieMakerAgent() {
   };
 
   const quickActions = [
-    { icon: Upload, label: "Upload Video", action: "I want to upload a video" },
+    {
+      icon: Upload,
+      label: "Upload Content",
+      action: "I want to upload video, audio, or documents",
+    },
     {
       icon: Video,
-      label: "Create Clips",
-      action: "Help me create short clips",
+      label: "Suggest Clips",
+      action:
+        "Analyze my content and suggest 2-3 attractive video clip options with timestamps",
     },
     {
       icon: Sparkles,
-      label: "Auto-Generate",
-      action: "Automatically generate clips from my video",
+      label: "Ask Questions",
+      action: "What are the key topics discussed in my files?",
     },
   ];
 
@@ -490,9 +887,11 @@ export default function MovieMakerAgent() {
                               : "bg-muted"
                           } rounded-2xl px-4 py-3`}
                         >
-                          <p className="text-sm whitespace-pre-wrap">
-                            {message.content}
-                          </p>
+                          <div className="text-sm prose prose-sm dark:prose-invert max-w-none prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-1 prose-headings:my-3 prose-pre:my-2 prose-code:text-xs overflow-x-auto prose-table:w-auto prose-table:min-w-full">
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                              {message.content}
+                            </ReactMarkdown>
+                          </div>
                         </div>
                         {message.role === "user" && (
                           <Avatar className="h-8 w-8 border border-border">
